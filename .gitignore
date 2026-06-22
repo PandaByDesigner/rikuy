@@ -1,0 +1,57 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Runtime output
+*.log
+logs/
+
+# Local configuration and secrets
+config.ini
+config.local.ini
+.env
+.env.*
+!.env.example
+secrets.ini
+credentials.ini
+
+# Windows and editor metadata
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Temporary and backup files
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+~$*
+
+# Local Codex/agent workspace metadata
+.agents/
+.codex/
