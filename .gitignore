@@ -19,6 +19,10 @@ build/
 dist/
 *.egg-info/
 .eggs/
+*.egg
+*.whl
+pip-wheel-metadata/
+*.spec
 
 # Runtime output
 *.log
