@@ -10,6 +10,8 @@ import sys
 import time
 import logging
 import configparser
+import tempfile
+import glob
 
 # --- Third-Party Imports ---
 import cv2
@@ -20,10 +22,11 @@ except ImportError:
     pyaudio = None
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
-    QComboBox, QProgressBar, QPushButton, QSizePolicy, QMessageBox
+    QGridLayout, QComboBox, QProgressBar, QPushButton, QSizePolicy,
+    QMessageBox, QFrame, QFileDialog
 )
-from PyQt6.QtGui import QImage, QPixmap, QFont, QIcon
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap, QIcon, QKeySequence
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QStandardPaths
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -45,6 +48,16 @@ VIDEO_FRAME_RATE = 30
 VIDEO_WARMUP_FRAMES = 6
 VISIBLE_FRAME_MEAN_THRESHOLD = 3.0
 VIDEO_SCAN_MISSES_AFTER_LAST_DEVICE = 2
+VIDEO_READ_FAILURE_LIMIT = 30
+VIDEO_READ_WARNING_INTERVAL = 5
+VIDEO_THREAD_STOP_TIMEOUT_MS = 3000
+SMOKE_TEST_DURATION_MS = 4000
+TOP_BAR_NARROW_WIDTH = 840
+TOP_BAR_WIDE_WIDTH = 1450
+BLACK_FRAME_STATUS_MESSAGE = (
+    'Camera connected, but the image is black.\n'
+    'Check the privacy shutter, lens, cable, or input signal.'
+)
 DEFAULT_RESOLUTIONS = [
     (640, 480),
     (1280, 720),
@@ -81,7 +94,70 @@ def get_video_capture_backends():
             ('DirectShow', cv2.CAP_DSHOW),
             ('Media Foundation', cv2.CAP_MSMF),
         ]
+    if sys.platform.startswith('linux'):
+        return [('Video4Linux2', cv2.CAP_V4L2)]
     return [('Default', cv2.CAP_ANY)]
+
+
+def linux_video_device_supports_capture(device_path):
+    """Return True for V4L2 video-capture nodes, excluding metadata nodes."""
+    import fcntl
+    import struct
+
+    vidioc_querycap = 0x80685600
+    v4l2_cap_video_capture = 0x00000001
+    v4l2_cap_video_capture_mplane = 0x00001000
+    v4l2_cap_device_caps = 0x80000000
+    capability_buffer = bytearray(104)
+
+    try:
+        device_fd = os.open(device_path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as error:
+        logging.warning('Could not inspect %s: %s', device_path, error)
+        return True
+
+    try:
+        fcntl.ioctl(device_fd, vidioc_querycap, capability_buffer, True)
+    except OSError as error:
+        logging.warning('Could not query V4L2 capabilities for %s: %s', device_path, error)
+        return True
+    finally:
+        os.close(device_fd)
+
+    _, capabilities, device_capabilities = struct.unpack_from('=III', capability_buffer, 80)
+    effective_capabilities = (
+        device_capabilities
+        if capabilities & v4l2_cap_device_caps
+        else capabilities
+    )
+    capture_flags = v4l2_cap_video_capture | v4l2_cap_video_capture_mplane
+    return bool(effective_capabilities & capture_flags)
+
+
+def get_video_device_indices():
+    """Return camera indices that are worth probing on the current platform."""
+    if sys.platform.startswith('linux'):
+        indices = []
+        for device_path in glob.glob('/dev/video*'):
+            suffix = os.path.basename(device_path).removeprefix('video')
+            if suffix.isdigit() and linux_video_device_supports_capture(device_path):
+                indices.append(int(suffix))
+        return sorted(set(indices))
+    return list(range(VIDEO_DEVICE_SCAN_LIMIT))
+
+
+def get_video_device_name(index):
+    """Return a useful platform-native camera name for a capture index."""
+    if sys.platform.startswith('linux'):
+        name_path = f'/sys/class/video4linux/video{index}/name'
+        try:
+            with open(name_path, 'r', encoding='utf-8') as name_file:
+                device_name = name_file.read().strip()
+            if device_name:
+                return f'{device_name} (/dev/video{index})'
+        except OSError:
+            pass
+    return f'Camera {index}'
 
 
 def frame_looks_visible(frame):
@@ -142,11 +218,14 @@ def format_resolution(width, height):
 
 def parse_resolution_text(text):
     """Parse a resolution label like '1280x720' into a tuple."""
-    if not text or "x" not in text:
+    if not isinstance(text, str) or not text or "x" not in text:
         return None
     try:
         width_text, height_text = text.lower().split("x", 1)
-        return int(width_text), int(height_text)
+        width, height = int(width_text), int(height_text)
+        if width <= 0 or height <= 0:
+            return None
+        return width, height
     except ValueError:
         return None
 
@@ -192,6 +271,21 @@ def probe_audio_input_device(p, device_info):
     return False, None, None, last_error
 
 
+def read_config_value(config, option, fallback, getter):
+    """Read one setting without allowing a malformed value to discard others."""
+    try:
+        return getattr(config, getter)('Settings', option, fallback=fallback)
+    except (ValueError, configparser.Error) as error:
+        logging.warning(
+            "Invalid config value for %s=%r; using %r (%s)",
+            option,
+            config.get('Settings', option, raw=True, fallback=None),
+            fallback,
+            error,
+        )
+        return fallback
+
+
 def load_settings():
     """
     Load settings from the config file.
@@ -211,22 +305,22 @@ def load_settings():
         'locked_output_name': '',
     }
     try:
-        if config.read(config_path):
+        if config.read(config_path, encoding='utf-8'):
             if 'Settings' in config:
-                settings['video_id'] = config.getint('Settings', 'last_video_id', fallback=-1)
-                settings['audio_id'] = config.getint('Settings', 'last_audio_id', fallback=-1)
-                settings['resolution_w'] = config.getint('Settings', 'last_resolution_w', fallback=-1)
-                settings['resolution_h'] = config.getint('Settings', 'last_resolution_h', fallback=-1)
-                settings['locked_audio_id'] = config.getint('Settings', 'locked_audio_id', fallback=-1)
-                settings['locked_audio_name'] = config.get('Settings', 'locked_audio_name', fallback='').strip()
-                settings['monitor_audio'] = config.getboolean('Settings', 'monitor_audio', fallback=False)
-                settings['locked_output_id'] = config.getint('Settings', 'locked_output_id', fallback=-1)
-                settings['locked_output_name'] = config.get('Settings', 'locked_output_name', fallback='').strip()
-            logging.info(f"Loaded settings from {config_path}: {settings}")
+                settings['video_id'] = read_config_value(config, 'last_video_id', -1, 'getint')
+                settings['audio_id'] = read_config_value(config, 'last_audio_id', -1, 'getint')
+                settings['resolution_w'] = read_config_value(config, 'last_resolution_w', -1, 'getint')
+                settings['resolution_h'] = read_config_value(config, 'last_resolution_h', -1, 'getint')
+                settings['locked_audio_id'] = read_config_value(config, 'locked_audio_id', -1, 'getint')
+                settings['locked_audio_name'] = read_config_value(config, 'locked_audio_name', '', 'get').strip()
+                settings['monitor_audio'] = read_config_value(config, 'monitor_audio', False, 'getboolean')
+                settings['locked_output_id'] = read_config_value(config, 'locked_output_id', -1, 'getint')
+                settings['locked_output_name'] = read_config_value(config, 'locked_output_name', '', 'get').strip()
+            logging.info("Loaded settings from %s: %s", config_path, settings)
         else:
-            logging.info(f"{config_path} not found, using default settings.")
+            logging.info("%s not found, using default settings.", config_path)
     except Exception as e:
-        logging.error(f"Error loading settings from {config_path}: {e}", exc_info=True)
+        logging.error("Error loading settings from %s: %s", config_path, e, exc_info=True)
     return settings
 
 
@@ -265,11 +359,23 @@ def save_settings(
         'locked_output_id': str(locked_output_id),
         'locked_output_name': locked_output_name.strip(),
     }
+    temporary_path = None
     try:
-        with open(config_path, 'w', encoding='utf-8') as configfile:
+        config_directory = os.path.dirname(os.path.abspath(config_path))
+        config_filename = os.path.basename(config_path)
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f'.{config_filename}.',
+            suffix='.tmp',
+            dir=config_directory,
+            text=True,
+        )
+        with os.fdopen(file_descriptor, 'w', encoding='utf-8') as configfile:
             config.write(configfile)
+        os.replace(temporary_path, config_path)
         logging.info(
-            'Saved settings to %s: Video=%s, Audio=%s, Res=%s, LockedAudioId=%s, LockedAudioName=%s, MonitorAudio=%s, LockedOutputId=%s, LockedOutputName=%s',
+            'Saved settings to %s: Video=%s, Audio=%s, Res=%s, '
+            'LockedAudioId=%s, LockedAudioName=%s, MonitorAudio=%s, '
+            'LockedOutputId=%s, LockedOutputName=%s',
             config_path,
             video_id,
             audio_id,
@@ -280,11 +386,19 @@ def save_settings(
             locked_output_id,
             locked_output_name,
         )
+        return True
     except Exception as e:
         logging.error(f"Error saving settings to {config_path}: {e}", exc_info=True)
+        return False
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                logging.warning("Could not remove temporary config file %s", temporary_path)
 
 
-def list_video_devices():
+def list_video_devices(show_error=False, parent=None):
     """
     List available video capture devices using OpenCV.
     Returns:
@@ -293,38 +407,56 @@ def list_video_devices():
     devices = []
 
     consecutive_misses = 0
-    for index in range(VIDEO_DEVICE_SCAN_LIMIT):
+    for index in get_video_device_indices():
         found_device = False
         for backend_name, backend in get_video_capture_backends():
-            cap_test = cv2.VideoCapture(index, backend)
+            cap_test = None
             try:
+                cap_test = cv2.VideoCapture(index, backend)
                 if cap_test.isOpened():
                     ret, frame = cap_test.read()
-                    if ret and frame is not None:
+                    if ret and frame is not None and frame.size > 0:
                         try:
                             width = int(cap_test.get(cv2.CAP_PROP_FRAME_WIDTH))
                             height = int(cap_test.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                            name = f"Camera {index} ({width}x{height})"
+                            name = f"{get_video_device_name(index)} ({width}x{height})"
                         except Exception:
                             logging.warning(f"Could not get properties for Camera {index}", exc_info=False)
-                            name = f"Camera {index}"
+                            name = get_video_device_name(index)
                         logging.info("Found video device %s using %s", index, backend_name)
                         devices.append({'id': index, 'name': name})
                         found_device = True
                         break
+            except Exception as error:
+                logging.warning(
+                    "Could not probe camera %s with %s: %s",
+                    index,
+                    backend_name,
+                    error,
+                )
             finally:
-                cap_test.release()
+                if cap_test is not None:
+                    try:
+                        cap_test.release()
+                    except Exception as error:
+                        logging.warning(
+                            "Could not release camera %s probe for %s: %s",
+                            index,
+                            backend_name,
+                            error,
+                        )
 
         if found_device:
             consecutive_misses = 0
-        elif devices:
+        elif devices and not sys.platform.startswith('linux'):
             consecutive_misses += 1
             if consecutive_misses >= VIDEO_SCAN_MISSES_AFTER_LAST_DEVICE:
                 break
 
     if not devices:
         logging.warning('No video devices found.')
-        QMessageBox.critical(None, 'No Cameras Found', 'No video devices were found on this system.')
+        if show_error and not sys.platform.startswith('linux'):
+            QMessageBox.warning(parent, 'No Cameras Found', 'No video devices were found on this system.')
         devices.append({'id': -1, 'name': 'No Video Devices Found'})
 
     return devices
@@ -608,13 +740,18 @@ class VideoThread(QThread):
     frame_signal = pyqtSignal(QImage)
     status_signal = pyqtSignal(str)
     error_signal = pyqtSignal(str)
+    capture_opened_signal = pyqtSignal(str, int, int)
 
     def __init__(self, device_index, resolution, parent=None):
         super().__init__(parent)
         self.device_index = device_index
         self.target_resolution = resolution
-        self._running = False
+        self._running = True
         self.video_capture = None
+
+    def stop_requested(self):
+        """Return True once shutdown has been requested, including before run()."""
+        return not self._running or self.isInterruptionRequested()
 
     def candidate_resolutions(self):
         """Return requested resolution plus conservative fallbacks."""
@@ -638,8 +775,10 @@ class VideoThread(QThread):
         """Read several startup frames and prefer the first visible one."""
         last_frame = None
         for _ in range(VIDEO_WARMUP_FRAMES):
+            if self.stop_requested():
+                break
             ret, frame = capture.read()
-            if ret and frame is not None:
+            if ret and frame is not None and frame.size > 0:
                 last_frame = frame
                 if frame_looks_visible(frame):
                     return frame, True
@@ -651,41 +790,71 @@ class VideoThread(QThread):
 
         for backend_name, backend in get_video_capture_backends():
             for resolution in self.candidate_resolutions():
+                if self.stop_requested():
+                    return None, None
+
                 logging.info(
                     "[VideoThread %s] Opening capture with %s at %s",
                     self.device_index,
                     backend_name,
                     format_resolution(*resolution) if resolution else 'default resolution',
                 )
-                capture = cv2.VideoCapture(self.device_index, backend)
-                if not capture.isOpened():
-                    capture.release()
-                    continue
+                capture = None
+                selected = False
+                try:
+                    capture = cv2.VideoCapture(self.device_index, backend)
+                    if not capture.isOpened():
+                        continue
 
-                self.configure_capture(capture, resolution)
-                first_frame, visible = self.read_startup_frame(capture)
-                actual_w = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-                actual_h = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    self.configure_capture(capture, resolution)
+                    first_frame, visible = self.read_startup_frame(capture)
+                    if self.stop_requested():
+                        return None, None
 
-                if first_frame is not None:
-                    logging.info(
-                        "[VideoThread %s] Using %s at %sx%s%s",
+                    actual_w = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    actual_h = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+                    if first_frame is not None:
+                        if actual_w <= 0 or actual_h <= 0:
+                            actual_h, actual_w = first_frame.shape[:2]
+                        logging.info(
+                            "[VideoThread %s] Using %s at %sx%s%s",
+                            self.device_index,
+                            backend_name,
+                            actual_w,
+                            actual_h,
+                            '' if visible else ' (black/no visible signal)',
+                        )
+                        self.capture_opened_signal.emit(backend_name, actual_w, actual_h)
+                        selected = True
+                        return capture, first_frame
+
+                    logging.warning(
+                        "[VideoThread %s] %s at %sx%s did not return a readable startup frame.",
                         self.device_index,
                         backend_name,
                         actual_w,
                         actual_h,
-                        '' if visible else ' (black/no visible signal)',
                     )
-                    return capture, first_frame
-
-                logging.warning(
-                    "[VideoThread %s] %s at %sx%s did not return a readable startup frame.",
-                    self.device_index,
-                    backend_name,
-                    actual_w,
-                    actual_h,
-                )
-                capture.release()
+                except Exception as error:
+                    logging.warning(
+                        "[VideoThread %s] %s at %s failed: %s",
+                        self.device_index,
+                        backend_name,
+                        format_resolution(*resolution) if resolution else 'default resolution',
+                        error,
+                    )
+                finally:
+                    if capture is not None and not selected:
+                        try:
+                            capture.release()
+                        except Exception as error:
+                            logging.warning(
+                                "[VideoThread %s] Could not release failed %s capture: %s",
+                                self.device_index,
+                                backend_name,
+                                error,
+                            )
 
         return None, None
 
@@ -699,10 +868,16 @@ class VideoThread(QThread):
 
     def run(self):
         """Start the video capture and emit frames as QImage."""
-        self._running = True
         try:
+            if self.stop_requested():
+                logging.info("[VideoThread %s] Startup cancelled.", self.device_index)
+                return
+
             logging.info(f"[VideoThread {self.device_index}] Opening capture...")
             self.video_capture, first_frame = self.open_capture()
+
+            if self.stop_requested():
+                return
 
             if not self.video_capture or not self.video_capture.isOpened():
                 error_msg = f"Could not open video device {self.device_index}"
@@ -714,53 +889,101 @@ class VideoThread(QThread):
                 if frame_looks_visible(first_frame):
                     self.emit_frame(first_frame)
                 else:
-                    self.status_signal.emit(
-                        'Camera connected, but the image is black.\n'
-                        'Check the privacy shutter, lens, cable, or input signal.'
-                    )
+                    self.status_signal.emit(BLACK_FRAME_STATUS_MESSAGE)
 
             waiting_for_visible_frame = not frame_looks_visible(first_frame)
-            while self._running:
+            consecutive_read_failures = 0
+            while not self.stop_requested():
                 ret, frame = self.video_capture.read()
-                if ret:
+                if self.stop_requested():
+                    break
+
+                frame_is_valid = ret and frame is not None and frame.size > 0
+                if frame_is_valid:
+                    recovered_after_failures = consecutive_read_failures > 0
                     try:
                         if waiting_for_visible_frame:
                             if frame_looks_visible(frame):
                                 waiting_for_visible_frame = False
                                 self.emit_frame(frame)
+                            elif recovered_after_failures:
+                                self.status_signal.emit(BLACK_FRAME_STATUS_MESSAGE)
                         else:
                             self.emit_frame(frame)
+                        consecutive_read_failures = 0
                     except Exception as e:
+                        consecutive_read_failures += 1
                         logging.error(f"[VideoThread {self.device_index}] Error processing frame: {e}")
                 else:
-                    logging.warning(f"[VideoThread {self.device_index}] Failed to grab frame.")
+                    consecutive_read_failures += 1
+
+                if consecutive_read_failures:
+                    if (
+                        consecutive_read_failures == 1
+                        or consecutive_read_failures % VIDEO_READ_WARNING_INTERVAL == 0
+                    ):
+                        logging.warning(
+                            "[VideoThread %s] Failed to process frame (%s/%s).",
+                            self.device_index,
+                            consecutive_read_failures,
+                            VIDEO_READ_FAILURE_LIMIT,
+                        )
+                    if consecutive_read_failures == VIDEO_READ_WARNING_INTERVAL:
+                        self.status_signal.emit('Camera signal interrupted. Retrying...')
+                    if consecutive_read_failures >= VIDEO_READ_FAILURE_LIMIT:
+                        error_msg = (
+                            f"Camera {self.device_index} stopped responding after "
+                            f"{VIDEO_READ_FAILURE_LIMIT} consecutive frame failures."
+                        )
+                        logging.error(error_msg)
+                        self._running = False
+                        self.error_signal.emit(error_msg)
+                        break
                     time.sleep(0.1)
 
                 frame_delay = max((1.0 / VIDEO_FRAME_RATE) - 0.005, 0.001)
                 time.sleep(frame_delay)
         except Exception as e:
-            error_msg = f"Error in VideoThread {self.device_index}: {e}"
-            logging.error(error_msg, exc_info=True)
-            self.error_signal.emit(error_msg)
+            if not self.stop_requested():
+                error_msg = f"Error in VideoThread {self.device_index}: {e}"
+                logging.error(error_msg, exc_info=True)
+                self.error_signal.emit(error_msg)
         finally:
-            if self.video_capture and self.video_capture.isOpened():
-                self.video_capture.release()
-                logging.info(f"[VideoThread {self.device_index}] Video capture released.")
+            if self.video_capture:
+                try:
+                    self.video_capture.release()
+                    logging.info(f"[VideoThread {self.device_index}] Video capture released.")
+                except Exception as error:
+                    logging.warning(
+                        "[VideoThread %s] Could not release video capture: %s",
+                        self.device_index,
+                        error,
+                    )
+                self.video_capture = None
             self._running = False
             logging.info(f"[VideoThread {self.device_index}] Thread finished.")
 
-    def stop(self):
+    def stop(self, timeout_ms=VIDEO_THREAD_STOP_TIMEOUT_MS):
+        """Request shutdown and report whether the worker actually stopped."""
         self._running = False
-        self.wait(2000)
+        self.requestInterruption()
+        stopped = self.wait(timeout_ms)
+        if not stopped:
+            logging.error(
+                "[VideoThread %s] Did not stop within %sms.",
+                self.device_index,
+                timeout_ms,
+            )
+        return stopped
 
 
 # --- Main Window ---
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Rikuy - Webcam Viewer')
-        self.setGeometry(100, 100, 800, 600)
-        self.setMinimumSize(400, 300)
+        self.setWindowTitle('Rikuy! - Webcam Viewer')
+        self.resize(1120, 780)
+        self.setMinimumSize(640, 440)
 
         icon_path = get_app_file_path('Rikuy_Condor_Icon.ico')
         if os.path.exists(icon_path):
@@ -773,6 +996,9 @@ class MainWindow(QMainWindow):
         self.audio_thread = None
         self.video_thread = None
         self.current_frame = None
+        self.capture_description = ''
+        self.video_ready = False
+        self.video_session_accepts_signals = False
         self.is_closing = False
         self.audio_enabled = False
         self.p_audio_main = pyaudio.PyAudio() if AUDIO_FEATURE_ENABLED and pyaudio else None
@@ -796,27 +1022,59 @@ class MainWindow(QMainWindow):
 
     def setup_ui(self):
         central_widget = QWidget(self)
+        central_widget.setObjectName('appRoot')
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(12, 10, 12, 12)
+        main_layout.setSpacing(9)
 
-        self.video_label = QLabel('Initializing...')
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        self.video_label.setStyleSheet('background-color: black; color: white;')
-        font = QFont()
-        font.setPointSize(20)
-        self.video_label.setFont(font)
-        main_layout.addWidget(self.video_label, 1)
+        self.top_bar = QFrame()
+        self.top_bar.setObjectName('topBar')
+        self.top_bar_layout = QGridLayout(self.top_bar)
+        self.top_bar_layout.setContentsMargins(0, 0, 0, 0)
+        self.top_bar_layout.setHorizontalSpacing(10)
+        self.top_bar_layout.setVerticalSpacing(6)
 
-        controls_layout = QHBoxLayout()
-        main_layout.addLayout(controls_layout)
+        self.title_block = QWidget()
+        self.title_block.setObjectName('titleBlock')
+        self.title_block.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        title_layout = QVBoxLayout(self.title_block)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(0)
+        self.app_title = QLabel('Rikuy!')
+        self.app_title.setObjectName('appTitle')
+        self.app_subtitle = QLabel('A focused, friendly camera preview')
+        self.app_subtitle.setObjectName('appSubtitle')
+        title_layout.addWidget(self.app_title)
+        title_layout.addWidget(self.app_subtitle)
 
-        video_control_group = QHBoxLayout()
-        video_control_group.addWidget(QLabel('Video:'))
+        self.status_label = QLabel('Ready')
+        self.status_label.setObjectName('cameraStatus')
+        self.status_label.setProperty('state', 'idle')
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setMaximumWidth(440)
+        self.status_label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        self.status_label.setAccessibleName('Camera status')
+
+        self.camera_control = QWidget()
+        self.camera_control.setObjectName('cameraControl')
+        self.camera_control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        camera_layout = QVBoxLayout(self.camera_control)
+        camera_layout.setContentsMargins(0, 0, 0, 0)
+        camera_layout.setSpacing(2)
+        self.camera_label = QLabel('&Camera')
+        self.camera_label.setObjectName('fieldLabel')
         self.video_combo = QComboBox()
+        self.video_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.video_combo.setMinimumContentsLength(24)
+        self.video_combo.setMinimumWidth(180)
+        self.video_combo.setAccessibleName('Camera')
+        self.video_combo.setAccessibleDescription('Changing cameras restarts the live preview.')
+        self.video_combo.setToolTip('Choose the camera used for the preview (Alt+C).')
         self.video_combo.currentIndexChanged.connect(self.change_video_device)
-        video_control_group.addWidget(self.video_combo)
-        controls_layout.addLayout(video_control_group)
+        self.camera_label.setBuddy(self.video_combo)
+        camera_layout.addWidget(self.camera_label)
+        camera_layout.addWidget(self.video_combo)
 
         self.audio_combo = QComboBox()
         self.audio_combo.currentIndexChanged.connect(self.change_audio_device)
@@ -827,34 +1085,201 @@ class MainWindow(QMainWindow):
         self.volume_bar.setValue(0)
         self.volume_bar.setTextVisible(False)
         self.volume_bar.setFixedWidth(150)
+        self.audio_controls = QWidget()
+        self.audio_controls.setObjectName('audioControls')
+        audio_controls_layout = QHBoxLayout(self.audio_controls)
+        audio_controls_layout.setContentsMargins(0, 0, 0, 0)
+        audio_controls_layout.setSpacing(8)
         if AUDIO_FEATURE_ENABLED:
-            audio_control_group = QHBoxLayout()
-            audio_control_group.addWidget(QLabel('Audio:'))
-            audio_control_group.addWidget(self.audio_combo)
+            audio_controls_layout.addWidget(QLabel('Audio:'))
+            audio_controls_layout.addWidget(self.audio_combo)
             self.audio_toggle_button.setText('Disconnect Mic')
-            audio_control_group.addWidget(self.audio_toggle_button)
-            controls_layout.addLayout(audio_control_group)
-
-            mic_control_group = QHBoxLayout()
-            mic_control_group.addWidget(QLabel('Mic Level:'))
-            mic_control_group.addWidget(self.volume_bar)
-            controls_layout.addLayout(mic_control_group)
+            audio_controls_layout.addWidget(self.audio_toggle_button)
+            audio_controls_layout.addWidget(QLabel('Mic Level:'))
+            audio_controls_layout.addWidget(self.volume_bar)
         else:
             self.audio_combo.setEnabled(False)
             self.audio_toggle_button.setEnabled(False)
+            self.audio_controls.hide()
 
-        resolution_control_group = QHBoxLayout()
-        resolution_control_group.addWidget(QLabel('Resolution:'))
+        self.resolution_control = QWidget()
+        self.resolution_control.setObjectName('resolutionControl')
+        self.resolution_control.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        resolution_layout = QVBoxLayout(self.resolution_control)
+        resolution_layout.setContentsMargins(0, 0, 0, 0)
+        resolution_layout.setSpacing(2)
+        self.resolution_label = QLabel('&Resolution')
+        self.resolution_label.setObjectName('fieldLabel')
         self.resolution_combo = QComboBox()
+        self.resolution_combo.setMinimumWidth(110)
+        self.resolution_combo.setAccessibleName('Resolution')
+        self.resolution_combo.setAccessibleDescription('Changing resolution restarts the live preview.')
+        self.resolution_combo.setToolTip('Choose the requested camera resolution (Alt+R).')
         self.resolution_combo.currentIndexChanged.connect(self.change_resolution)
-        resolution_control_group.addWidget(self.resolution_combo)
-        controls_layout.addLayout(resolution_control_group)
+        self.resolution_label.setBuddy(self.resolution_combo)
+        resolution_layout.addWidget(self.resolution_label)
+        resolution_layout.addWidget(self.resolution_combo)
 
-        self.refresh_button = QPushButton('Refresh Devices')
+        self.actions_widget = QWidget()
+        self.actions_widget.setObjectName('topBarActions')
+        self.actions_widget.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+        actions_layout = QHBoxLayout(self.actions_widget)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(8)
+
+        self.mirror_button = QPushButton('&Mirror')
+        self.mirror_button.setCheckable(True)
+        self.mirror_button.setShortcut(QKeySequence('Alt+M'))
+        self.mirror_button.setToolTip('Mirror the preview without changing camera capture (Alt+M).')
+        self.mirror_button.toggled.connect(self.toggle_mirror)
+        actions_layout.addWidget(self.mirror_button)
+
+        self.snapshot_button = QPushButton('Save &Frame')
+        self.snapshot_button.setEnabled(False)
+        self.snapshot_button.setShortcut(QKeySequence('Ctrl+S'))
+        self.snapshot_button.setToolTip('Save the current visible frame as a PNG (Ctrl+S).')
+        self.snapshot_button.clicked.connect(self.save_snapshot)
+        actions_layout.addWidget(self.snapshot_button)
+
+        self.fullscreen_button = QPushButton('Fullscreen')
+        self.fullscreen_button.setShortcut(QKeySequence('F11'))
+        self.fullscreen_button.setToolTip('Toggle full-screen mode (F11; Esc to exit).')
+        self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
+        actions_layout.addWidget(self.fullscreen_button)
+
+        self.refresh_button = QPushButton('Refresh Cameras')
+        self.refresh_button.setObjectName('primaryButton')
+        self.refresh_button.setShortcut(QKeySequence('F5'))
+        self.refresh_button.setToolTip('Scan for connected cameras again (F5).')
         self.refresh_button.clicked.connect(self.refresh_devices)
-        controls_layout.addWidget(self.refresh_button)
+        actions_layout.addWidget(self.refresh_button)
 
-        controls_layout.addStretch(1)
+        self._top_bar_mode = None
+        self.arrange_top_bar(self.top_bar_mode_for_width(self.width()))
+        main_layout.addWidget(self.top_bar)
+
+        self.preview_frame = QFrame()
+        self.preview_frame.setObjectName('previewFrame')
+        preview_layout = QVBoxLayout(self.preview_frame)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.video_label = QLabel('Initializing...')
+        self.video_label.setObjectName('videoPreview')
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.video_label.setWordWrap(True)
+        self.video_label.setAccessibleName('Camera preview')
+        preview_layout.addWidget(self.video_label)
+        main_layout.addWidget(self.preview_frame, 1)
+
+    def top_bar_mode_for_width(self, width):
+        """Choose a top-bar arrangement that keeps every control readable."""
+        if width < TOP_BAR_NARROW_WIDTH:
+            return 'narrow'
+        if width < TOP_BAR_WIDE_WIDTH:
+            return 'medium'
+        return 'wide'
+
+    def restore_control_shortcuts(self):
+        """Reapply explicit shortcuts after button text or mode changes."""
+        self.mirror_button.setShortcut(QKeySequence('Alt+M'))
+        self.snapshot_button.setShortcut(QKeySequence('Ctrl+S'))
+        self.fullscreen_button.setShortcut(QKeySequence('F11'))
+        self.refresh_button.setShortcut(QKeySequence('F5'))
+
+    def arrange_top_bar(self, mode):
+        """Keep controls in the top bar, wrapping only as width requires."""
+        narrow = mode == 'narrow'
+        snapshot_text = 'Save &Frame' if narrow else 'Save'
+        refresh_text = 'Refresh Cameras' if narrow else 'Refresh'
+        if self.snapshot_button.text() != snapshot_text:
+            self.snapshot_button.setText(snapshot_text)
+        if self.refresh_button.text() != refresh_text:
+            self.refresh_button.setText(refresh_text)
+        self.restore_control_shortcuts()
+        self.app_subtitle.setVisible(mode == 'wide' and self.width() >= 1800)
+
+        self.actions_widget.setMaximumWidth(16777215)
+        self.actions_widget.layout().invalidate()
+        self.actions_widget.updateGeometry()
+        if not narrow:
+            self.actions_widget.setMaximumWidth(self.actions_widget.sizeHint().width())
+
+        if self._top_bar_mode == mode:
+            return
+        self._top_bar_mode = mode
+
+        top_bar_widgets = (
+            self.title_block,
+            self.camera_control,
+            self.resolution_control,
+            self.actions_widget,
+            self.status_label,
+            self.audio_controls,
+        )
+        for widget in top_bar_widgets:
+            self.top_bar_layout.removeWidget(widget)
+        for column in range(6):
+            self.top_bar_layout.setColumnStretch(column, 0)
+
+        if mode == 'narrow':
+            self.top_bar_layout.addWidget(self.title_block, 0, 0)
+            self.top_bar_layout.addWidget(
+                self.status_label,
+                0,
+                1,
+                alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
+            self.top_bar_layout.addWidget(self.camera_control, 1, 0)
+            self.top_bar_layout.addWidget(self.resolution_control, 1, 1)
+            self.top_bar_layout.addWidget(self.actions_widget, 2, 0, 1, 2)
+            if AUDIO_FEATURE_ENABLED:
+                self.top_bar_layout.addWidget(self.audio_controls, 3, 0, 1, 2)
+            self.top_bar_layout.setColumnStretch(0, 1)
+        elif mode == 'medium':
+            self.top_bar_layout.addWidget(self.title_block, 0, 0)
+            self.top_bar_layout.addWidget(
+                self.status_label,
+                0,
+                1,
+                1,
+                2,
+                alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
+            self.top_bar_layout.addWidget(self.camera_control, 1, 0)
+            self.top_bar_layout.addWidget(self.resolution_control, 1, 1)
+            self.top_bar_layout.addWidget(
+                self.actions_widget,
+                1,
+                2,
+                alignment=Qt.AlignmentFlag.AlignVCenter,
+            )
+            if AUDIO_FEATURE_ENABLED:
+                self.top_bar_layout.addWidget(self.audio_controls, 2, 0, 1, 3)
+            self.top_bar_layout.setColumnStretch(0, 1)
+        else:
+            self.top_bar_layout.addWidget(self.title_block, 0, 0)
+            self.top_bar_layout.addWidget(self.camera_control, 0, 1)
+            self.top_bar_layout.addWidget(self.resolution_control, 0, 2)
+            self.top_bar_layout.addWidget(
+                self.actions_widget,
+                0,
+                3,
+                alignment=Qt.AlignmentFlag.AlignVCenter,
+            )
+            self.top_bar_layout.addWidget(
+                self.status_label,
+                0,
+                4,
+                alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
+            if AUDIO_FEATURE_ENABLED:
+                self.top_bar_layout.addWidget(self.audio_controls, 1, 0, 1, 5)
+            self.top_bar_layout.setColumnStretch(1, 1)
+
+        self.actions_widget.layout().invalidate()
+        self.actions_widget.updateGeometry()
+        self.top_bar_layout.activate()
 
     def load_stylesheet(self):
         """Load the optional QSS file if it exists."""
@@ -870,11 +1295,102 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logging.error(f"Failed to load stylesheet from {style_path}: {e}", exc_info=True)
 
+    def set_camera_status(self, message, state='idle'):
+        """Update the compact camera status badge and its visual state."""
+        self.status_label.setText(message)
+        if self.status_label.property('state') != state:
+            self.status_label.setProperty('state', state)
+            self.status_label.style().unpolish(self.status_label)
+            self.status_label.style().polish(self.status_label)
+        self.status_label.setAccessibleDescription(message)
+
+    def set_controls_busy(self, busy):
+        """Prevent overlapping camera changes during a synchronous device scan."""
+        self.video_combo.setEnabled(not busy)
+        self.resolution_combo.setEnabled(not busy)
+        self.refresh_button.setEnabled(not busy)
+
+    def video_signal_is_current(self):
+        """Ignore queued events emitted by a camera thread that was superseded."""
+        source = self.sender()
+        if source is None:
+            return True
+        return self.video_session_accepts_signals and source is self.video_thread
+
+    def handle_capture_opened(self, backend_name, width, height):
+        """Show which backend and negotiated resolution opened successfully."""
+        if not self.video_signal_is_current():
+            logging.info('Ignored capture-opened signal from an old video thread.')
+            return
+        self.capture_description = f'{backend_name} - {width}x{height}'
+        self.set_camera_status(f'Connected - {self.capture_description}', 'connecting')
+
+    def toggle_mirror(self, enabled):
+        """Mirror only the rendered preview; camera frames remain unchanged."""
+        self.mirror_button.setText('Mirrored' if enabled else '&Mirror')
+        self.mirror_button.setShortcut(QKeySequence('Alt+M'))
+        self.render_video_frame()
+
+    def save_snapshot(self):
+        """Save the currently displayed frame after an explicit file choice."""
+        if self.current_frame is None or self.current_frame.isNull():
+            self.set_camera_status('No camera frame is available to save', 'warning')
+            return
+
+        pictures_dir = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.PicturesLocation
+        ) or APP_DIR
+        default_name = f"Rikuy-{time.strftime('%Y%m%d-%H%M%S')}.png"
+        default_path = os.path.join(pictures_dir, default_name)
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            'Save Camera Frame',
+            default_path,
+            'PNG Images (*.png)',
+        )
+        if not file_path:
+            return
+        if not os.path.splitext(file_path)[1]:
+            file_path += '.png'
+
+        image_to_save = self.current_frame
+        if self.mirror_button.isChecked():
+            image_to_save = image_to_save.mirrored(True, False)
+
+        if image_to_save.save(file_path, 'PNG'):
+            logging.info('Saved camera frame to %s', file_path)
+            self.set_camera_status('Snapshot saved', 'live')
+        else:
+            logging.error('Could not save camera frame to %s', file_path)
+            self.set_camera_status('Could not save the camera frame', 'error')
+            QMessageBox.warning(self, 'Save Failed', 'Rikuy could not save that camera frame.')
+
+    def toggle_fullscreen(self):
+        """Toggle full-screen viewing while keeping all controls available."""
+        if self.isFullScreen():
+            self.showNormal()
+            self.fullscreen_button.setText('Fullscreen')
+        else:
+            self.showFullScreen()
+            self.fullscreen_button.setText('Windowed')
+        self.fullscreen_button.setShortcut(QKeySequence('F11'))
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
+            self.toggle_fullscreen()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def populate_devices(self):
         self.video_combo.blockSignals(True)
         self.video_combo.clear()
         for device in self.available_video_devices:
             self.video_combo.addItem(device['name'], userData=device['id'])
+            item_index = self.video_combo.count() - 1
+            model_item = self.video_combo.model().item(item_index)
+            if model_item is not None and device['id'] == -1:
+                model_item.setEnabled(False)
         self.video_combo.blockSignals(False)
 
         self.audio_combo.blockSignals(True)
@@ -957,26 +1473,50 @@ class MainWindow(QMainWindow):
 
     def update_video_display(self, qt_image):
         """Receive QImage from VideoThread and update the label."""
+        if not self.video_signal_is_current():
+            logging.info('Ignored frame signal from an old video thread.')
+            return
         if not qt_image.isNull():
+            first_visible_frame = not self.video_ready
             self.current_frame = qt_image
+            self.video_ready = True
+            self.snapshot_button.setEnabled(True)
             self.render_video_frame()
+            if first_visible_frame:
+                details = self.capture_description or f'Camera {self.current_video_device_id}'
+                self.set_camera_status(f'Live - {details}', 'live')
         else:
             logging.warning('Received null QImage in update_video_display')
 
     def update_video_status(self, message):
         """Show a non-fatal camera status until a visible frame arrives."""
+        if not self.video_signal_is_current():
+            logging.info('Ignored status signal from an old video thread.')
+            return
         self.current_frame = None
+        self.video_ready = False
+        self.snapshot_button.setEnabled(False)
         self.video_label.clear()
         self.video_label.setText(message)
+        status_message = (
+            'No visible image'
+            if '\n' in message
+            else message
+        )
+        self.set_camera_status(status_message, 'warning')
+        self.status_label.setAccessibleDescription(message.replace('\n', ' '))
 
     def render_video_frame(self):
         """Scale and show the latest frame using the current label size."""
         if self.current_frame is None or self.current_frame.isNull():
             return
 
-        pixmap = QPixmap.fromImage(self.current_frame)
+        display_image = self.current_frame
+        if self.mirror_button.isChecked():
+            display_image = display_image.mirrored(True, False)
+        pixmap = QPixmap.fromImage(display_image)
         scaled_pixmap = pixmap.scaled(
-            self.video_label.size(),
+            self.video_label.contentsRect().size(),
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
@@ -984,10 +1524,16 @@ class MainWindow(QMainWindow):
 
     def handle_video_error(self, error_msg):
         """Handle errors signaled from VideoThread on the UI thread."""
+        if not self.video_signal_is_current():
+            logging.info('Ignored error signal from an old video thread: %s', error_msg)
+            return
         logging.error(f"Video Error: {error_msg}")
         self.current_frame = None
+        self.video_ready = False
+        self.snapshot_button.setEnabled(False)
         self.video_label.clear()
         self.video_label.setText(f'Video Error: {error_msg}')
+        self.set_camera_status('Camera unavailable', 'error')
         self.stop_capture(stop_video=True, stop_audio=False)
         if not self.is_closing:
             QMessageBox.critical(self, 'Video Error', error_msg)
@@ -1011,6 +1557,9 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if hasattr(self, 'top_bar_layout'):
+            self.arrange_top_bar(self.top_bar_mode_for_width(event.size().width()))
+            self.centralWidget().layout().activate()
         self.render_video_frame()
 
     def restore_combo_selection(self, combo_box, preferred_value):
@@ -1083,17 +1632,25 @@ class MainWindow(QMainWindow):
         previous_audio = self.audio_combo.currentData()
 
         logging.info('Refreshing device lists.')
-        self.stop_capture()
-        self.available_video_devices = list_video_devices()
-        if AUDIO_FEATURE_ENABLED:
-            self.available_audio_devices = list_audio_devices(self.p_audio_main, self.last_settings)
-            self.available_output_devices = list_output_devices(self.p_audio_main)
-            self.output_device = resolve_output_device(self.last_settings, self.available_output_devices)
-        self.populate_devices()
-        self.restore_combo_selection(self.video_combo, previous_video)
-        if AUDIO_FEATURE_ENABLED:
-            self.restore_combo_selection(self.audio_combo, previous_audio)
-        self.update_audio_lock_ui()
+        self.set_camera_status('Refreshing cameras...', 'connecting')
+        self.set_controls_busy(True)
+        QApplication.processEvents()
+        try:
+            if not self.stop_capture():
+                self.set_camera_status('Camera is still shutting down', 'error')
+                return
+            self.available_video_devices = list_video_devices(show_error=True, parent=self)
+            if AUDIO_FEATURE_ENABLED:
+                self.available_audio_devices = list_audio_devices(self.p_audio_main, self.last_settings)
+                self.available_output_devices = list_output_devices(self.p_audio_main)
+                self.output_device = resolve_output_device(self.last_settings, self.available_output_devices)
+            self.populate_devices()
+            self.restore_combo_selection(self.video_combo, previous_video)
+            if AUDIO_FEATURE_ENABLED:
+                self.restore_combo_selection(self.audio_combo, previous_audio)
+            self.update_audio_lock_ui()
+        finally:
+            self.set_controls_busy(False)
         self.start_capture()
 
     def toggle_audio(self):
@@ -1118,11 +1675,14 @@ class MainWindow(QMainWindow):
         if selected_id is not None and selected_id != current_id and selected_id != -1:
             device_name = self.video_combo.itemText(index)
             logging.info(f"Video device change requested: ID={selected_id}, Name='{device_name}'")
-            self.stop_capture(stop_video=True, stop_audio=False)
-            self.start_capture(start_video=True, start_audio=False)
+            if self.stop_capture(stop_video=True, stop_audio=False):
+                self.start_capture(start_video=True, start_audio=False)
+            else:
+                self.set_camera_status('Camera is still shutting down', 'error')
         elif selected_id == -1:
             logging.info('Video device set to None.')
             self.stop_capture(stop_video=True, stop_audio=False)
+            self.set_camera_status('No camera selected', 'idle')
 
     def change_audio_device(self, index):
         if not AUDIO_FEATURE_ENABLED:
@@ -1152,8 +1712,10 @@ class MainWindow(QMainWindow):
         if selected_res:
             res_text = self.resolution_combo.itemText(index)
             logging.info(f"Resolution change requested: {res_text}")
-            self.stop_capture(stop_video=True, stop_audio=False)
-            self.start_capture(start_video=True, start_audio=False)
+            if self.stop_capture(stop_video=True, stop_audio=False):
+                self.start_capture(start_video=True, start_audio=False)
+            else:
+                self.set_camera_status('Camera is still shutting down', 'error')
 
     def start_capture(self, start_video=True, start_audio=True):
         """Start new capture threads based on current selections and flags."""
@@ -1165,20 +1727,41 @@ class MainWindow(QMainWindow):
         self.current_audio_device_id = audio_id if AUDIO_FEATURE_ENABLED and audio_id is not None else -1
 
         if start_video and video_id is not None and video_id != -1:
+            if self.video_thread is not None:
+                if self.video_thread.isRunning():
+                    logging.error('Refusing to start a second VideoThread while one is active.')
+                    self.set_camera_status('Previous camera is still shutting down', 'error')
+                    return
+                if not self.stop_capture(stop_video=True, stop_audio=False):
+                    self.set_camera_status('Previous camera is still shutting down', 'error')
+                    return
+
             logging.info(f"Starting VideoThread for device {video_id} with resolution {resolution}")
-            self.video_thread = VideoThread(video_id, resolution)
-            self.video_thread.frame_signal.connect(self.update_video_display)
-            self.video_thread.status_signal.connect(self.update_video_status)
-            self.video_thread.error_signal.connect(self.handle_video_error)
-            self.video_thread.start()
+            video_thread = VideoThread(video_id, resolution, parent=self)
+            self.video_thread = video_thread
+            self.video_session_accepts_signals = True
+            video_thread.frame_signal.connect(self.update_video_display)
+            video_thread.status_signal.connect(self.update_video_status)
+            video_thread.error_signal.connect(self.handle_video_error)
+            video_thread.capture_opened_signal.connect(self.handle_capture_opened)
             self.current_frame = None
+            self.capture_description = ''
+            self.video_ready = False
+            self.snapshot_button.setEnabled(False)
             self.video_label.clear()
             self.video_label.setText('Starting camera...')
+            self.set_camera_status('Starting camera...', 'connecting')
+            video_thread.start()
         elif start_video:
             logging.info('No video device selected, capture not started.')
             self.current_frame = None
+            self.capture_description = ''
+            self.video_ready = False
+            self.video_session_accepts_signals = False
+            self.snapshot_button.setEnabled(False)
             self.video_label.clear()
-            self.video_label.setText('No Video Device Selected')
+            self.video_label.setText('No camera is available.\nConnect one, then choose Refresh Cameras.')
+            self.set_camera_status('No camera selected', 'idle')
 
         if start_audio and not AUDIO_FEATURE_ENABLED:
             logging.info('Audio capture is disabled.')
@@ -1205,16 +1788,35 @@ class MainWindow(QMainWindow):
 
         self.update_audio_button_state()
 
-    def stop_capture(self, stop_video=True, stop_audio=True):
-        """Stop video/audio threads and release resources selectively."""
+    def stop_capture(
+        self,
+        stop_video=True,
+        stop_audio=True,
+        video_timeout_ms=VIDEO_THREAD_STOP_TIMEOUT_MS,
+    ):
+        """Stop capture workers, retaining any thread that fails to exit."""
+        video_stopped = True
         if stop_video and self.video_thread:
-            vid_id = self.video_thread.device_index
-            if self.video_thread.isRunning():
+            video_thread = self.video_thread
+            vid_id = video_thread.device_index
+            self.video_session_accepts_signals = False
+            was_running = video_thread.isRunning()
+            if was_running:
                 logging.info(f"Stopping VideoThread for device {vid_id}...")
-                self.video_thread.stop()
+            else:
+                logging.info(f"Cancelling pending VideoThread for device {vid_id}...")
+            video_stopped = video_thread.stop(video_timeout_ms)
+            if video_stopped and was_running:
                 logging.info(f"VideoThread stopped for device {vid_id}.")
-            self.video_thread = None
-            self.current_frame = None
+            if video_stopped and self.video_thread is video_thread:
+                self.video_thread = None
+                self.current_frame = None
+                self.capture_description = ''
+                self.video_ready = False
+                self.snapshot_button.setEnabled(False)
+                video_thread.deleteLater()
+            elif not video_stopped:
+                logging.error('Retaining VideoThread %s because it is still running.', vid_id)
 
         if stop_audio and self.audio_thread:
             aud_id = self.audio_thread.device_index
@@ -1224,12 +1826,22 @@ class MainWindow(QMainWindow):
                 logging.info(f"AudioThread stopped for device {aud_id}.")
             self.audio_thread = None
             self.volume_bar.setValue(0)
+        return video_stopped
 
     def closeEvent(self, event):
         """Ensure cleanup when window is closed."""
         logging.info('Closing application...')
         self.is_closing = True
-        self.stop_capture()
+        if not self.stop_capture(video_timeout_ms=5000):
+            self.is_closing = False
+            event.ignore()
+            self.set_camera_status('Camera did not shut down; close was cancelled', 'error')
+            QMessageBox.warning(
+                self,
+                'Camera Still Running',
+                'The camera worker did not shut down safely. Wait a moment and try closing again.',
+            )
+            return
 
         current_res = self.resolution_combo.currentData()
         if isinstance(current_res, str):
@@ -1256,8 +1868,14 @@ class MainWindow(QMainWindow):
 
 # --- Main Execution ---
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
+    smoke_test = '--smoke-test' in sys.argv
+    qt_arguments = [argument for argument in sys.argv if argument != '--smoke-test']
+    app = QApplication(qt_arguments)
+    app.setApplicationName('Rikuy')
+    app.setDesktopFileName('rikuy')
     window = MainWindow()
     window.show()
+    if smoke_test:
+        QTimer.singleShot(SMOKE_TEST_DURATION_MS, window.close)
     logging.info('Application started.')
     sys.exit(app.exec())

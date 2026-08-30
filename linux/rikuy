@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
+config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+export RIKUY_CONFIG="${RIKUY_CONFIG:-${config_home}/rikuy/config.ini}"
+
+exec /usr/bin/python "$data_home/rikuy/rikuy.py" "$@"

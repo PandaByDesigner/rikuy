@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Rikuy
+Comment=Webcam viewer
+Exec=rikuy
+Icon=rikuy
+Terminal=false
+Categories=AudioVideo;Video;
+StartupNotify=true
+StartupWMClass=rikuy
