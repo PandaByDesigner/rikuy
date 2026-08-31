@@ -1,5 +1,9 @@
 # Rikuy!
 
+<p align="center">
+  <img src="Rikuy_Condor_Icon.ico" alt="Rikuy condor icon" width="160">
+</p>
+
 Rikuy! is a Windows-first PyQt6 webcam viewer built on OpenCV, with native
 Linux Video4Linux2 support. It scans for available cameras, restores the last
 selected camera and resolution, and presents a responsive live-preview layout
